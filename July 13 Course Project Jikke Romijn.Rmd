@@ -1,0 +1,165 @@
+---
+title: "Coursera Course Project Machine Learning"
+author: "Jikke Romijn"
+date: "13 juli 2016"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+This document contains my work for the Coursera Machine Learning course project. The purpose of this project is to pick and tune a machine learning algorithm for predicting the manner in which subjects have performed an exercise, from physical data that have been collected by sensors on the belt, forearm, arm, and dumbbell of 6 participants. The goal is to be able to predict from these data how well the exercise was executed.
+
+***Executive Summary***
+
+I have tried various different algorithms that are specifically useful for classification predictions. I have used internal cross-validation in caret's train-function to get an estimate of out of sample accuracy of each algorithm. These analyses showed that the Random Forest algorithm is very accurate, with 98.4% accuracy and 1.41% out of sample error (see Figure 4).
+
+***Data preparation and exploration***
+
+First, I opened the available training and testing data and prepared it for the analysis:
+
+```{r}
+###Loading necessary libraries
+library(caret);library(dplyr);library(class); library(rpart)
+
+###Reading the downloaded files
+training <- read.csv("./pml-training.csv", header=TRUE, na.strings=c("NA",""))
+testing <- read.csv("./pml-testing.csv", header=TRUE, na.strings=c("NA",""))
+
+###Preprocessing the data
+###Many variables contain (almost) only NA's. I remove these from both datasets
+training <- training[, (colSums(is.na(training))==0)]
+testing <- testing[, (colSums(is.na(testing))==0)]
+
+###Some variables contain information about the measurements, but aren't potential predictors. I remove these from both datasets
+backgrvars <- grepl("X|user_name|timestamp|window", colnames(training))
+training <- training[, !backgrvars]
+backgrvars <- grepl("X|user_name|timestamp|window", colnames(testing))
+testing <- testing[, !backgrvars]
+```
+
+Next, I split the training set into a training and a validation set for cross validation purposes.
+
+```{r}
+###Creating a subset from training set for cross validation
+set.seed(123)
+inTrain <- createDataPartition(y=training$classe,
+                               p=0.60, list=FALSE)
+training <- training[inTrain,]
+validation <- training[-inTrain,]
+```
+
+***Feature Selection***
+
+The data have 52 variables that are potential predictors of the quality of the exercise (the 'classe' variable). Many variables are likely to be highly correlated as they are just different parameters coming from the same sensor. To prevent overfitting and also to reduce computing time as my computer tends to have trouble with some algorithms, I used a correlation matrix to drop some highly correlated variables from the training data set. This reduced the number of potential predictors from 52 to 30.
+
+```{r}
+###Perform analysis to find the important features to include in the models and save them in a reduced training data set.
+correlationMatrix <- cor(training[,1:52])
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.70)
+highlyCorrelated <- sort(highlyCorrelated)
+training_reduced <- training[, -c(highlyCorrelated)]
+dim(training)
+dim(training_reduced)
+```
+
+***1st model: Decision Tree using rpart package***
+
+The most simple solution for dealing with classification problems is to use a decision tree. The tuning parameter of the rpart algorithm is the complexity parameter (cp). It is used to control the size of the decision tree and to select the optimal tree size. If the cost of adding another variable to the decision tree from the current node is above the value of cp, then tree building does not continue. I have pruned the decision tree based on the cp associated with the lowest relative error (see Figure 1).
+
+The in-sample accuracy of the decision tree is 90.9%. In order to estimate the out of sample accuracy I predicted the "classe" variable in the validation data set. In the validation data set the predictions are also 90.9% accurate. 
+
+```{r}
+###Grow a tree using the Rpart package
+set.seed(123)
+ModTree <- rpart(classe ~ ., data=training_reduced, control=rpart.control(minsplit=30, cp = 0.0001))
+
+###Create a variable called bestcp (for Best Complexity Parameter) to use for pruning based on lowest cross-validated error
+bestcp <- ModTree$cptable[which.min(ModTree$cptable[,"xerror"]),"CP"]
+
+###Prune the tree based on the lowest cross-validated error
+ModTreepruned <- prune(ModTree, cp = bestcp)
+printcp(ModTreepruned)
+plotcp(ModTreepruned)
+```
+```{r, echo=FALSE}
+print("Figure 1: graphical representation of CP associated with lowest X-Val relative error")
+```
+```{r}
+###Constructing confusion matrix in order to find out in-sample tree accuracy of pruned tree
+conf.matrix <- table(training_reduced$classe, predict(ModTreepruned,type="class"))
+rownames(conf.matrix) <- paste("Actual", rownames(conf.matrix), sep = ":")
+colnames(conf.matrix) <- paste("Pred", colnames(conf.matrix), sep = ":")
+print(conf.matrix)
+
+###Calculate in-sample accuracy
+accuracy<- training_reduced$classe==predict(ModTreepruned, type="class")
+sum(accuracy[TRUE])/length(accuracy)
+
+###Calculate out of sample accuracy using the validation data set
+validation$prediction <- predict(ModTreepruned, newdata=validation, type="class")
+accuracyOOS <- validation$classe==validation$prediction
+sum(accuracyOOS[TRUE])/length(accuracyOOS)
+```
+
+***2nd model: Random Forest within caret package***
+
+One of the best performing algorithms for classification problems is the random forest. I used the trainControl parameter within the train function in Caret for cross-validation, using 10 folds allowing parallel processing for speed. The tuning parameter 'mtry' was not predefined. According to the model summary (Figure 2), the accuracy of the Random Forest is 98.4% at an mtry value of 2 in the final model, which was selected on largest value of accuracy. This makes it a much better solution than the simple decision tree.
+
+```{r}
+####Creating 2nd model using Random Forest within Caret package
+###Configure parallel processing for improved performance of Random Forest and Specify method of cross-validation
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fitControl <- trainControl(method="cv", number=10, allowParallel=TRUE)
+
+###Set seed and train model using RF method
+set.seed(123)
+ModForest<- train(classe~. , method="rf", data=training_reduced, trControl=fitControl)
+stopCluster(cluster)
+
+###Unregister parallel backend to make sure connection is closed
+registerDoSEQ()
+
+###Obtain model results and estimated out of sample accuracy
+print(ModForest)
+```
+```{r, echo=FALSE}
+print("Figure 2: Random Forest results summary showing accuracy of final model")
+```
+```{r}
+confusionMatrix.train(ModForest)
+```
+
+***3rd model: Stochastic Gradient Boosting using gbm-method in caret package***
+
+Boosting is also widely acknowledged as one of the best algorithms for classification problems. I trained the model using the same trainControl parameter for cross-validation that was specified for the Random Forest. Tuning parameters 'interaction depth' and 'n.trees' have not been specified. Final model was selected on largest value of accuracy, which is 90.8% at an interaction depth of 3 and n.trees=150 (see Figure 3), making it the second best option but far inferior in this case to the Random Forest. The out of sample error is 9.2%.
+
+```{r}
+###Specify method of cross-validation 
+fitControl <- trainControl(method="cv", number=10)
+###Set seed and train model using GBM method, and obtain estimate of out of sample accuracy
+set.seed(123)
+ModBoost <- train(classe ~ ., method="gbm",data=training_reduced, verbose=FALSE, trControl=fitControl)
+
+print(ModBoost)
+```
+```{r, echo=FALSE}
+print("Figure 3: Model summary showing accuracy of final model")
+```
+```{r}
+confusionMatrix.train(ModBoost)
+```
+
+***Final Model***
+
+The final model I will use for the prediction assignment is the Random Forest, with an accuracy of 98.4% and 1.41% out of sample error:
+
+```{r}
+varImp(ModForest)
+ModForest$finalModel
+```
+```{r, echo=FALSE}
+print("Figure 4: Model summary of chosen model, also stating Out of Sample error (OOB), of 1.41%")
+```
